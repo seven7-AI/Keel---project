@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 import os
 import pymysql
 from datetime import datetime
-from pony.orm import Database, Required, Optional, PrimaryKey, db_session, commit
+from pony.orm import Database, PrimaryKey, db_session, commit
 
 # =====================================================
 # 1. DATABASE CONFIGURATION AND CONNECTION TEST
@@ -131,24 +131,62 @@ customer_id:3,notes:High risk driver,phone:555-0789
     
     print("✅ All sample data files created successfully!")
 
-# =====================================================
-# 3. DEFINE ORM ENTITIES
-# =====================================================
+# ----- Find the single customer table (prefer CARINSUR_CUSTOMER) -----
+def _find_customer_table():
+    with pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SHOW TABLES")
+            tables = [row[0] for row in cur.fetchall()]
+    if "CARINSUR_CUSTOMER" in tables:
+        return "CARINSUR_CUSTOMER"
+    for t in tables:
+        if "customer" in t.lower() and t.lower() not in {"carinsur_policy", "carinsur_vehicle"}:
+            return t
+    raise RuntimeError(f"No customer table found. Existing tables: {tables}")
 
+def _get_table_columns(table_name):
+    with pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME) as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SHOW COLUMNS FROM `{table_name}`")
+            rows = cur.fetchall()
+            return [{"Field": r[0], "Type": r[1], "Null": r[2], "Key": r[3], "Default": r[4], "Extra": r[5]} for r in rows]
+
+def _pick_column(cols_set, candidates):
+    for c in candidates:
+        if c in cols_set:
+            return c
+    return None
+
+def _is_numeric(mysql_type):
+    t = mysql_type.lower()
+    return any(x in t for x in ["int", "decimal", "float", "double", "numeric"])
+
+def _required_cols(cols):
+    req = set()
+    for c in cols:
+        if c["Null"] == "NO" and c["Default"] is None and "auto_increment" not in c["Extra"]:
+            req.add(c["Field"])
+    return req
+
+def _primary_key(cols):
+    for c in cols:
+        if c["Key"] == "PRI":
+            return c["Field"], (_is_numeric(c["Type"]))
+    return None, False
+
+CUSTOMER_TABLE_NAME = _find_customer_table()
+CUSTOMER_COLS = _get_table_columns(CUSTOMER_TABLE_NAME)
+PK_COL, PK_IS_NUMERIC = _primary_key(CUSTOMER_COLS)
+if not PK_COL:
+    raise RuntimeError(f"Customer table `{CUSTOMER_TABLE_NAME}` has no primary key.")
+
+# Minimal entity just to keep Pony binding happy; writes are done via raw SQL
 class Customer(db.Entity):
-    _table_ = 'CUSTOMER'  # existing table in your DB
-    id = PrimaryKey(str, column='CUST_CODE')        # PK (store CSV id as string)
-    full_name = Required(str, column='CUST_NAME')   # join first + last
-    working_area = Optional(str, column='WORKING_AREA')
-    opening_amt = Optional(float, column='OPENING_AMT')
-    receive_amt = Optional(float, column='RECEIVE_AMT')
-    payment_amt = Optional(float, column='PAYMENT_AMT')
-    outstanding_amt = Optional(float, column='OUTSTANDING_AMT')
-    grade = Optional(int, column='GRADE')
-    cust_city = Optional(str, column='CUST_CITY')
-    cust_country = Optional(str, column='CUST_COUNTRY')
-    phone_no = Optional(str, column='PHONE_NO')
-    agent_code = Optional(str, column='AGENT_CODE')
+    _table_ = CUSTOMER_TABLE_NAME
+    if PK_IS_NUMERIC:
+        id = PrimaryKey(int, column=PK_COL)
+    else:
+        id = PrimaryKey(str, column=PK_COL)
 
 # =====================================================
 # 4. EXTRACTION FUNCTIONS
@@ -174,12 +212,8 @@ def read_vehicles_json(path):
     with open(path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     return [
-        {
-            'id': int(e['id']),
-            'model': e['model'].strip(),
-            'year': int(e['year']),
-            'customer_id': int(e['customer_id'])
-        } for e in data
+        {'id': int(e['id']), 'model': e['model'].strip(), 'year': int(e['year']), 'customer_id': int(e['customer_id'])}
+        for e in data
     ]
 
 def read_policies_xml(path):
@@ -256,99 +290,101 @@ def unify_records(customers, vehicles, policies, extras=None):
     return unified
 
 # =====================================================
-# 6. LOAD INTO DATABASE
+# 6. LOAD INTO DATABASE (safe UPSERT into one customer table)
 # =====================================================
 
-def get_fallback_agent_code():
-    """Return any existing AGENT_CODE from AGENTS table, or None if not present."""
+def _fallback_agent_code():
     try:
         with pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME) as conn:
             with conn.cursor() as cur:
+                cur.execute("SHOW TABLES LIKE 'AGENTS'")
+                if not cur.fetchone():
+                    return None
                 cur.execute("SELECT AGENT_CODE FROM AGENTS LIMIT 1")
-                row = cur.fetchone()
-                return row[0] if row else None
+                r = cur.fetchone()
+                return r[0] if r else None
     except Exception:
         return None
 
 def load_to_db(unified_dict):
-    """Persist unified records into the existing CUSTOMER table only (no new tables)."""
-    fallback_agent = get_fallback_agent_code()
+    cols_meta = {c["Field"]: c for c in CUSTOMER_COLS}
+    cols_set = set(cols_meta.keys())
+    required = _required_cols(CUSTOMER_COLS) - {PK_COL}
 
-    with db_session:
-        for cid, data in unified_dict.items():
-            cust_code = str(cid)
-            full_name = " ".join([x for x in [data.get('first_name'), data.get('last_name')] if x]) or ""
-            working_area = data.get('address') or "Unknown"
-            opening_amt = data.get('salary') if data.get('salary') is not None else 0.0
+    first_col = _pick_column(cols_set, ["FIRST_NAME","first_name","FirstName","FNAME","fname"])
+    last_col  = _pick_column(cols_set, ["LAST_NAME","last_name","LastName","LNAME","lname"])
+    name_col  = _pick_column(cols_set, ["FULL_NAME","full_name","NAME","name","CUST_NAME"])
+    addr_col  = _pick_column(cols_set, ["ADDRESS","address","Address","ADDR","addr","WORKING_AREA"])
+    sal_col   = _pick_column(cols_set, ["SALARY","salary","AnnualSalary","annual_salary","OPENING_AMT"])
+    city_col  = _pick_column(cols_set, ["CITY","city","CUST_CITY"])
+    country_col=_pick_column(cols_set, ["COUNTRY","country","CUST_COUNTRY"])
+    phone_col = _pick_column(cols_set, ["PHONE","phone","PHONE_NO","PHONE_NUMBER"])
+    grade_col = _pick_column(cols_set, ["GRADE","grade"])
+    agent_col = _pick_column(cols_set, ["AGENT_CODE","agent_code"])
 
-            defaults = {
-                'receive_amt': 0.0,
-                'payment_amt': 0.0,
-                'outstanding_amt': 0.0,
-                'grade': 1,
-                'cust_city': "Unknown",
-                'cust_country': "UK",
-                'phone_no': "",
-                'agent_code': fallback_agent
-            }
+    fallback_agent = _fallback_agent_code()
 
-            cust = Customer.get(id=cust_code)
-            if not cust:
-                Customer(
-                    id=cust_code,
-                    full_name=full_name,
-                    working_area=working_area,
-                    opening_amt=opening_amt,
-                    receive_amt=defaults['receive_amt'],
-                    payment_amt=defaults['payment_amt'],
-                    outstanding_amt=defaults['outstanding_amt'],
-                    grade=defaults['grade'],
-                    cust_city=defaults['cust_city'],
-                    cust_country=defaults['cust_country'],
-                    phone_no=defaults['phone_no'],
-                    agent_code=defaults['agent_code'],
-                )
-            else:
-                if not cust.full_name and full_name:
-                    cust.full_name = full_name
-                if (cust.working_area is None or not cust.working_area) and working_area:
-                    cust.working_area = working_area
-                if cust.opening_amt is None:
-                    cust.opening_amt = opening_amt
-                if cust.receive_amt is None:
-                    cust.receive_amt = defaults['receive_amt']
-                if cust.payment_amt is None:
-                    cust.payment_amt = defaults['payment_amt']
-                if cust.outstanding_amt is None:
-                    cust.outstanding_amt = defaults['outstanding_amt']
-                if cust.grade is None:
-                    cust.grade = defaults['grade']
-                if cust.cust_city is None:
-                    cust.cust_city = defaults['cust_city']
-                if cust.cust_country is None:
-                    cust.cust_country = defaults['cust_country']
-                if cust.phone_no is None:
-                    cust.phone_no = defaults['phone_no']
-                if cust.agent_code is None:
-                    cust.agent_code = defaults['agent_code']
+    with pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            for cid, data in unified_dict.items():
+                row = {}
+                row[PK_COL] = int(cid) if PK_IS_NUMERIC else str(cid)
 
-        commit()
-    print(f"✅ Loaded/updated {len(unified_dict)} customers into CUSTOMER.")
+                if name_col:
+                    full_name = " ".join([x for x in [data.get('first_name'), data.get('last_name')] if x]) or None
+                    row[name_col] = full_name or "Unknown"
+                else:
+                    if first_col: row[first_col] = data.get('first_name') or "Unknown"
+                    if last_col:  row[last_col]  = data.get('last_name')  or "Unknown"
+
+                if addr_col: row[addr_col] = data.get('address') or "Unknown"
+                if sal_col:  row[sal_col]  = (data.get('salary') if data.get('salary') is not None else 0)
+                if city_col: row[city_col] = "Unknown"
+                if country_col: row[country_col] = "UK"
+                if phone_col: row[phone_col] = ""
+                if grade_col: row[grade_col] = 1
+                if agent_col: row[agent_col] = fallback_agent
+
+                for col in required:
+                    if col not in row:
+                        t = cols_meta[col]["Type"].lower()
+                        if _is_numeric(t): row[col] = 0
+                        elif "date" in t: row[col] = "1970-01-01"
+                        else: row[col] = "Unknown"
+
+                insert_cols = list(row.keys())
+                insert_vals = [row[c] for c in insert_cols]
+                placeholders = ", ".join(["%s"]*len(insert_cols))
+                col_list = ", ".join(f"`{c}`" for c in insert_cols)
+                update_list = ", ".join(f"`{c}`=VALUES(`{c}`)" for c in insert_cols if c != PK_COL)
+
+                sql = f"INSERT INTO `{CUSTOMER_TABLE_NAME}` ({col_list}) VALUES ({placeholders})"
+                if update_list:
+                    sql += f" ON DUPLICATE KEY UPDATE {update_list}"
+                cur.execute(sql, insert_vals)
+
+    print(f"✅ Loaded/updated {len(unified_dict)} customers into {CUSTOMER_TABLE_NAME}.")
 
 # =====================================================
 # 7. QUERY AND DISPLAY RESULTS
 # =====================================================
 
 def display_results():
-    """Query and display the loaded data from CUSTOMER table"""
-    with db_session:
-        print("\n" + "="*50)
-        print("CUSTOMER TABLE CONTENTS")
-        print("="*50)
-        customers = Customer.select()[:]
-        print(f"\n📊 Total Customers (matching our IDs): {len(customers)}")
-        for c in customers:
-            print(f"- {c.id}: {c.full_name} | Area: {c.working_area} | Country: {c.cust_country} | OpeningAmt: {c.opening_amt}")
+    """Show top 50 rows from the customer table with all columns."""
+    with pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME) as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT * FROM `{CUSTOMER_TABLE_NAME}` LIMIT 50")
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+
+            print("\n" + "="*50)
+            print(f"{CUSTOMER_TABLE_NAME} TABLE CONTENTS")
+            print("="*50)
+            print(f"\n📊 Rows shown: {len(rows)}")
+            for r in rows:
+                line = " | ".join(f"{c}={v}" for c, v in zip(cols, r))
+                print(f" - {line}")
+
 
 # =====================================================
 # 8. MAIN EXECUTION
@@ -370,7 +406,7 @@ def main():
     try:
         db.bind(provider='mysql', host=DB_HOST, user=DB_USER, passwd=DB_PASSWORD, db=DB_NAME)
         db.generate_mapping(create_tables=False)  # do NOT create any tables
-        print("✅ Database mapping verified (no new tables created).")
+        print(f"✅ Database mapping verified (no new tables created). Using table: {CUSTOMER_TABLE_NAME}")
     except Exception as e:
         print(f"❌ Failed to set up database mapping: {e}")
         return
