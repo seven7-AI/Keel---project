@@ -1,0 +1,26 @@
+[
+  {
+    "id": 1,
+    "model": "Toyota Camry",
+    "year": 2020,
+    "customer_id": 1
+  },
+  {
+    "id": 2,
+    "model": "Honda Civic",
+    "year": 2019,
+    "customer_id": 2
+  },
+  {
+    "id": 3,
+    "model": "Ford F-150",
+    "year": 2021,
+    "customer_id": 3
+  },
+  {
+    "id": 4,
+    "model": "BMW X5",
+    "year": 2022,
+    "customer_id": 4
+  }
+]
