@@ -1,25 +1,3 @@
-# =====================================================
-# CARINSUR ETL SOLUTION
-# =====================================================
-# Assessment: Python ETL for CarInsur SME Car Insurance Company
-# 
-# BUSINESS PROBLEM:
-# CarInsur operates with siloed IT systems where customer data, vehicle data,
-# and insurance policy data are stored separately. This fragmentation poses
-# challenges as the company grows. They need a unified, central database
-# solution to consolidate all customer records.
-#
-# SOLUTION OVERVIEW:
-# This ETL pipeline extracts data from multiple formats (CSV, JSON, XML, TXT),
-# transforms and unifies records by customer ID, and loads them into a 
-# relational database using PonyORM. This eliminates manual intervention
-# and provides CarInsur with cohesive, centralized customer records.
-#
-# LIBRARIES USED (Assessment Compliant):
-# - Standard Python libraries: csv, json, xml.etree.ElementTree, os, datetime
-# - PonyORM: For relational database mapping and operations
-# - PyMySQL: For MySQL database connectivity
-# =====================================================
 import csv
 import json
 import xml.etree.ElementTree as ET
@@ -131,7 +109,6 @@ customer_id:3,notes:High risk driver,phone:555-0789
     
     print("✅ All sample data files created successfully!")
 
-# ----- Find the single customer table (prefer CARINSUR_CUSTOMER) -----
 def _find_customer_table():
     with pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME) as conn:
         with conn.cursor() as cur:
@@ -180,7 +157,6 @@ PK_COL, PK_IS_NUMERIC = _primary_key(CUSTOMER_COLS)
 if not PK_COL:
     raise RuntimeError(f"Customer table `{CUSTOMER_TABLE_NAME}` has no primary key.")
 
-# Minimal entity just to keep Pony binding happy; writes are done via raw SQL
 class Customer(db.Entity):
     _table_ = CUSTOMER_TABLE_NAME
     if PK_IS_NUMERIC:
@@ -290,7 +266,7 @@ def unify_records(customers, vehicles, policies, extras=None):
     return unified
 
 # =====================================================
-# 6. LOAD INTO DATABASE (safe UPSERT into one customer table)
+# 6. LOAD INTO DATABASE
 # =====================================================
 
 def _fallback_agent_code():
@@ -405,7 +381,7 @@ def main():
     print("\n3️⃣ Setting up database connection and tables...")
     try:
         db.bind(provider='mysql', host=DB_HOST, user=DB_USER, passwd=DB_PASSWORD, db=DB_NAME)
-        db.generate_mapping(create_tables=False)  # do NOT create any tables
+        db.generate_mapping(create_tables=False)
         print(f"✅ Database mapping verified (no new tables created). Using table: {CUSTOMER_TABLE_NAME}")
     except Exception as e:
         print(f"❌ Failed to set up database mapping: {e}")
