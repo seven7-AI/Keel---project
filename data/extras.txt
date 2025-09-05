@@ -1,3 +1,0 @@
-customer_id:1,alternate_address:456 Secondary St,phone:555-0123
-customer_id:2,emergency_contact:John Doe,phone:555-0456
-customer_id:3,notes:High risk driver,phone:555-0789
